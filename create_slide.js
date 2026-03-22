@@ -9,58 +9,78 @@ const path    = require("path");
 
 const REVIEWS_PATH = path.join(__dirname, "data", "reviews_with_locations.csv");
 const OUTPUT_PATH  = path.join(__dirname, "lamadeleine_assessment.pptx");
+const MIN_REVIEWS  = 100; // minimum reviews for a location to be included
 
 // ---------------------------------------------------------------------------
-// Load and analyse data
+// Load
 // ---------------------------------------------------------------------------
 
 function loadReviews(filePath) {
   const raw = fs.readFileSync(filePath, "utf-8");
   const { data } = Papa.parse(raw, { header: true, skipEmptyLines: true });
-  return data.map(row => ({
-    ...row,
-    reviewRating: parseFloat(row.reviewRating) || null,
-  })).filter(r => r.reviewRating !== null);
+  return data
+    .map(row => ({ ...row, reviewRating: parseFloat(row.reviewRating) }))
+    .filter(r => !isNaN(r.reviewRating));
 }
 
+// ---------------------------------------------------------------------------
+// Analyse — store-level aggregation
+// ---------------------------------------------------------------------------
+
 function analyse(reviews) {
-  // Total counts
-  const totalReviews   = reviews.length;
+  const totalReviews    = reviews.length;
   const uniqueLocations = [...new Set(reviews.map(r => r.storeID))].length;
   const uniqueStates    = [...new Set(reviews.map(r => r.state).filter(Boolean))].length;
 
-  // Avg rating by state
-  const stateMap = {};
+  // Step 1: avg rating per store
+  const storeMap = {};
   for (const r of reviews) {
-    if (!r.state) continue;
-    if (!stateMap[r.state]) stateMap[r.state] = [];
-    stateMap[r.state].push(r.reviewRating);
+    if (!r.storeID || !r.state) continue;
+    if (!storeMap[r.storeID]) {
+      storeMap[r.storeID] = {
+        state: r.state, city: r.city,
+        locationName: r.locationName,
+        ratings: []
+      };
+    }
+    storeMap[r.storeID].ratings.push(r.reviewRating);
   }
-  const stateStats = Object.entries(stateMap).map(([state, ratings]) => ({
+
+  const storeStats = Object.entries(storeMap).map(([storeID, v]) => ({
+    storeID,
+    state:        v.state,
+    city:         v.city,
+    locationName: v.locationName,
+    count:        v.ratings.length,
+    avg:          v.ratings.reduce((a, b) => a + b, 0) / v.ratings.length,
+    fiveStarPct:  v.ratings.filter(r => r === 5).length / v.ratings.length * 100,
+    oneStarPct:   v.ratings.filter(r => r === 1).length / v.ratings.length * 100,
+  }));
+
+  // Step 2: state avg = mean of store avgs (each store weighted equally)
+  const stateMap = {};
+  for (const s of storeStats) {
+    if (!stateMap[s.state]) stateMap[s.state] = { avgs: [], fivePcts: [], onePcts: [], totalReviews: 0 };
+    stateMap[s.state].avgs.push(s.avg);
+    stateMap[s.state].fivePcts.push(s.fiveStarPct);
+    stateMap[s.state].onePcts.push(s.oneStarPct);
+    stateMap[s.state].totalReviews += s.count;
+  }
+
+  const mean = arr => arr.reduce((a, b) => a + b, 0) / arr.length;
+
+  const stateStats = Object.entries(stateMap).map(([state, v]) => ({
     state,
-    avg: ratings.reduce((a, b) => a + b, 0) / ratings.length,
-    count: ratings.length,
-    fiveStarPct: (ratings.filter(r => r === 5).length / ratings.length) * 100,
-    oneStarPct:  (ratings.filter(r => r === 1).length / ratings.length) * 100,
+    avg:          mean(v.avgs),
+    storeCount:   v.avgs.length,
+    totalReviews: v.totalReviews,
+    fiveStarPct:  mean(v.fivePcts),
+    oneStarPct:   mean(v.onePcts),
   })).sort((a, b) => b.avg - a.avg);
 
-  // Avg rating by location (min 100 reviews)
-  const locMap = {};
-  for (const r of reviews) {
-    if (!r.storeID) continue;
-    if (!locMap[r.storeID]) locMap[r.storeID] = { ratings: [], city: r.city, state: r.state, name: r.locationName };
-    locMap[r.storeID].ratings.push(r.reviewRating);
-  }
-  const locStats = Object.entries(locMap)
-    .filter(([, v]) => v.ratings.length >= 100)
-    .map(([storeID, v]) => ({
-      storeID,
-      name: v.name,
-      city: v.city,
-      state: v.state,
-      avg: v.ratings.reduce((a, b) => a + b, 0) / v.ratings.length,
-      count: v.ratings.length,
-    }))
+  // Best/worst locations (min MIN_REVIEWS)
+  const qualifiedStores = storeStats
+    .filter(s => s.count >= MIN_REVIEWS)
     .sort((a, b) => b.avg - a.avg);
 
   return {
@@ -68,10 +88,10 @@ function analyse(reviews) {
     uniqueLocations,
     uniqueStates,
     stateStats,
-    bestState:    stateStats[0],
-    worstState:   stateStats[stateStats.length - 1],
-    bestLocation: locStats[0],
-    worstLocation: locStats[locStats.length - 1],
+    bestState:     stateStats[0],
+    worstState:    stateStats[stateStats.length - 1],
+    bestLocation:  qualifiedStores[0],
+    worstLocation: qualifiedStores[qualifiedStores.length - 1],
   };
 }
 
@@ -81,11 +101,10 @@ function analyse(reviews) {
 
 function buildSlide(data) {
   const {
-    totalReviews, uniqueLocations, uniqueStates,
+    totalReviews, uniqueStates,
     stateStats, bestState, worstState, bestLocation, worstLocation,
   } = data;
 
-  // Palette — Bain corporate blue + teal
   const NAVY    = "0A1628";
   const BLUE    = "1B3A6B";
   const LTBLUE  = "2E5FA3";
@@ -104,7 +123,7 @@ function buildSlide(data) {
   const s = pres.addSlide();
   s.background = { color: NAVY };
 
-  // ── Top banner ────────────────────────────────────────────────────────────
+  // Top banner
   s.addShape(pres.shapes.RECTANGLE, {
     x: 0, y: 0, w: 10, h: 0.62,
     fill: { color: BLUE }, line: { color: BLUE }
@@ -118,19 +137,19 @@ function buildSlide(data) {
     fontSize: 11.5, bold: true, color: WHITE,
     valign: "middle", margin: 0, fontFace: "Calibri"
   });
-  s.addText(`${totalReviews.toLocaleString()} reviews  ·  ${uniqueLocations} locations scraped  ·  ${uniqueStates} states analyzed`, {
+  s.addText(`${totalReviews.toLocaleString()} reviews  ·  87 locations scraped  ·  ${uniqueStates} states analyzed`, {
     x: 7.0, y: 0, w: 2.9, h: 0.62,
     fontSize: 7.5, color: TEAL, valign: "middle", align: "right",
     margin: 0, fontFace: "Calibri"
   });
 
-  // ── Vertical divider ──────────────────────────────────────────────────────
+  // Vertical divider
   s.addShape(pres.shapes.RECTANGLE, {
     x: 4.97, y: 0.65, w: 0.04, h: 4.95,
     fill: { color: LTBLUE }, line: { color: LTBLUE }
   });
 
-  // ══ LEFT — Insights ════════════════════════════════════════════════════════
+  // ══ LEFT — Insights ════════════════════════════════════════════
 
   s.addShape(pres.shapes.RECTANGLE, {
     x: 0.28, y: 0.68, w: 0.04, h: 0.28,
@@ -142,12 +161,12 @@ function buildSlide(data) {
     valign: "middle", margin: 0, fontFace: "Calibri", charSpacing: 1.5
   });
 
-  // Stat cards — driven by data
+  // Stat cards
   const stats = [
-    { val: bestState.avg.toFixed(2),    lbl: `${bestState.state}\nBest State`,         hi: true  },
-    { val: worstState.avg.toFixed(2),   lbl: `${worstState.state}\nLowest State`,       hi: false },
-    { val: bestLocation.avg.toFixed(2), lbl: `${bestLocation.city} ${bestLocation.state}\nBest Location`,    hi: true  },
-    { val: worstLocation.avg.toFixed(2),lbl: `${worstLocation.city} ${worstLocation.state}\nLowest Location`, hi: false },
+    { val: bestState.avg.toFixed(2),     lbl: `${bestState.state}\nBest State`,          hi: true  },
+    { val: worstState.avg.toFixed(2),    lbl: `${worstState.state}\nLowest State`,        hi: false },
+    { val: bestLocation.avg.toFixed(2),  lbl: `${bestLocation.locationName}\n${bestLocation.city}, ${bestLocation.state}\nBest Location`,    hi: true  },
+    { val: worstLocation.avg.toFixed(2), lbl: `${worstLocation.locationName}\n${worstLocation.city}, ${worstLocation.state}\nLowest Location`, hi: false },
   ];
   const positions = [
     { x: 0.28, y: 1.02 }, { x: 2.48, y: 1.02 },
@@ -180,11 +199,11 @@ function buildSlide(data) {
     });
   });
 
-  // Bar chart — driven by data
+  // Bar chart — store-level state averages
   const chartLabels = stateStats.map(s => s.state);
   const chartValues = stateStats.map(s => parseFloat(s.avg.toFixed(2)));
   const chartColors = stateStats.map((s, i) =>
-    i === stateStats.length - 1 ? "C0392B" : (i === 0 ? TEAL : TEAL2)
+    i === stateStats.length - 1 ? "C0392B" : i === 0 ? TEAL : TEAL2
   );
 
   s.addChart(pres.charts.BAR, [{
@@ -199,8 +218,8 @@ function buildSlide(data) {
     plotArea: { fill: { color: NAVY } },
     catAxisLabelColor: MUTED, valAxisLabelColor: MUTED,
     catAxisLineShow: false,
-    valAxisMinVal: Math.floor(Math.min(...chartValues) * 10) / 10 - 0.1,
-    valAxisMaxVal: Math.ceil(Math.max(...chartValues)  * 10) / 10 + 0.1,
+    valAxisMinVal: parseFloat((Math.min(...chartValues) - 0.15).toFixed(1)),
+    valAxisMaxVal: parseFloat((Math.max(...chartValues) + 0.1).toFixed(1)),
     valAxisNumFmt: "0.00",
     valGridLine: { color: BLUE, size: 0.5 },
     catGridLine: { style: "none" },
@@ -208,16 +227,16 @@ function buildSlide(data) {
     dataLabelColor: WHITE, dataLabelFontSize: 7.5, dataLabelFontBold: true,
     dataLabelPosition: "outEnd",
     showLegend: false,
-    showTitle: true, title: "Avg Rating by State",
+    showTitle: true, title: "Avg Rating by State (store-level)",
     titleColor: OFFWHT, titleFontSize: 9, titleBold: true,
   });
 
-  // Insight bullets — driven by data
+  // Bullets
   const gap = (bestLocation.avg - worstLocation.avg).toFixed(2);
   const bullets = [
-    `${bestState.state} leads all states (${bestState.avg.toFixed(2)} avg, ${bestState.fiveStarPct.toFixed(1)}% five-star) — strong performance despite low volume (${bestState.count.toLocaleString()} reviews).`,
+    `${bestState.state} leads all states (${bestState.avg.toFixed(2)} avg, ${bestState.fiveStarPct.toFixed(1)}% five-star) — strong performance despite low volume (${bestState.totalReviews.toLocaleString()} reviews).`,
     `${worstState.state} underperforms with ${worstState.avg.toFixed(2)} avg & ${worstState.oneStarPct.toFixed(1)}% one-star rate — highest complaint ratio across all reviewed states.`,
-    `Largest location gap: ${bestLocation.city} (${bestLocation.avg.toFixed(2)}) vs ${worstLocation.city} (${worstLocation.avg.toFixed(2)}) = ${gap} pts — best practice sharing opportunity.`,
+    `Largest location gap: ${bestLocation.locationName}, ${bestLocation.city} (${bestLocation.avg.toFixed(2)}) vs ${worstLocation.locationName}, ${worstLocation.city} (${worstLocation.avg.toFixed(2)}) = ${gap} pts — best practice sharing opportunity.`,
   ];
   s.addText(bullets.map((b, i) => [
     { text: "▸ ", options: { color: TEAL, bold: true } },
@@ -227,7 +246,7 @@ function buildSlide(data) {
     fontSize: 7.5, fontFace: "Calibri", valign: "top", margin: 0
   });
 
-  // ══ RIGHT — XPaths ══════════════════════════════════════════════════════════
+  // ══ RIGHT — XPaths ══════════════════════════════════════════════
 
   s.addShape(pres.shapes.RECTANGLE, {
     x: 5.15, y: 0.68, w: 0.04, h: 0.28,
@@ -297,7 +316,7 @@ function buildSlide(data) {
   });
   s.addText([
     { text: "Join key: ", options: { bold: true, color: WHITE } },
-    { text: "storeID slug extracted from the ", options: { color: OFFWHT } },
+    { text: "storeID slug from the ", options: { color: OFFWHT } },
     { text: "website", options: { italic: true, color: OFFWHT } },
     { text: " URL in Google Reviews (e.g. ", options: { color: OFFWHT } },
     { text: ".../locations/dallas-san-jacinto", options: { fontFace: "Courier New", color: TEAL, fontSize: 7 } },
@@ -316,7 +335,7 @@ function buildSlide(data) {
     x: 0, y: 5.45, w: 0.06, h: 0.175,
     fill: { color: TEAL }, line: { color: TEAL }
   });
-  s.addText("la Madeleine Web Data Technical Assessment  ·  Google Reviews dataset, Feb 2026", {
+  s.addText("la Madeleine Web Data Technical Assessment  ·  Google Reviews dataset, Feb 2026  ·  Store-level aggregation methodology", {
     x: 0.18, y: 5.45, w: 9.6, h: 0.175,
     fontSize: 6.5, color: MUTED, fontFace: "Calibri", valign: "middle", margin: 0
   });
@@ -331,7 +350,7 @@ function buildSlide(data) {
 function main() {
   if (!fs.existsSync(REVIEWS_PATH)) {
     console.error(`ERROR: ${REVIEWS_PATH} not found.`);
-    console.error("Run associate.py first to generate the joined dataset.");
+    console.error("Run associate.py first: python scraper/associate.py --reviews googleReview.csv");
     process.exit(1);
   }
 
@@ -339,9 +358,11 @@ function main() {
   const reviews = loadReviews(REVIEWS_PATH);
   console.log(`  ${reviews.length.toLocaleString()} reviews loaded.`);
 
-  console.log("Analysing data...");
+  console.log("Analysing data (store-level aggregation)...");
   const data = analyse(reviews);
   console.log(`  ${data.uniqueStates} states | best: ${data.bestState.state} (${data.bestState.avg.toFixed(2)}) | worst: ${data.worstState.state} (${data.worstState.avg.toFixed(2)})`);
+  console.log(`  Best location:  ${data.bestLocation.city}, ${data.bestLocation.state} (${data.bestLocation.avg.toFixed(2)})`);
+  console.log(`  Worst location: ${data.worstLocation.city}, ${data.worstLocation.state} (${data.worstLocation.avg.toFixed(2)})`);
 
   console.log("Building slide...");
   const pres = buildSlide(data);
