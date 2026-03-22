@@ -1,9 +1,12 @@
 name: Quarterly Location Scrape
 
 on:
-  schedule:
-    - cron: "*/5 * * * *"
+  # Manual trigger — run anytime from the GitHub Actions UI
   workflow_dispatch:
+
+  # Quarterly schedule — 1st of Jan, Apr, Jul, Oct at 06:00 UTC
+  schedule:
+    - cron: "0 6 1 1,4,7,10 *"
 
 jobs:
   scrape:
@@ -13,10 +16,10 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install dependencies
         run: pip install -r requirements.txt
@@ -26,8 +29,11 @@ jobs:
 
       - name: Commit and push updated data
         run: |
-          git config user.name "github-actions[bot]"
+          git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add data/
-          git diff --cached --quiet || git commit -m "chore: quarterly data update $(date +'%Y-%m-%d')"
+          git diff --cached --quiet \
+            || git commit -m "chore: quarterly data update $(date +'%Y-%m-%d')"
           git push
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
